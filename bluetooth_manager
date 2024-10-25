@@ -1,0 +1,79 @@
+#!/bin/bash
+
+connect_device() {
+    local device_name=$1
+    if [ -z "$device_name" ]; then
+        echo "No device specified. Attempting to connect to known devices..."
+        known_devices=$(bluetoothctl devices | awk '{print $2}')
+		if [ -z "$known_devices" ]; then
+			echo "No known devices. Exiting..."
+			exit 1
+		fi
+        for device in $known_devices; do
+            echo "Trying to connect to $device..."
+            if bluetoothctl connect "$device"; then
+                echo "Successfully connected to $device."
+                return 0
+            fi
+            echo "Failed to connect to $device."
+            sleep 1
+        done
+        echo "All known devices failed to connect."
+    else
+        echo "Attempting to connect to $device_name..."
+		mac_address=$(bluetoothctl devices | grep -i "$device_name" | awk '{print $2}')
+		if [ -n "$mac_address" ]; then
+            echo "Attempting to connect to $device_name ($mac_address)..."
+            if bluetoothctl connect "$mac_address"; then
+                echo "Successfully connected to $device_name."
+            else
+                echo "Failed to connect to $device_name."
+            fi
+        else
+            echo "Device '$device_name' not found."
+        fi
+    fi
+}
+
+restart_bluetooth() {
+	echo "Restarting bluetooth..."
+	rfkill block bluetooth
+	rfkill unblock bluetooth
+	echo "Restarted bluetooth."
+}
+
+if [ "$#" -lt 1 ]; then
+    echo -e "Usage: $0 [option] [device_name]\n"
+	echo "Options -"
+	echo -e "  restart                         \t Restart bluetooth incase it isn't powering on"
+	echo -e "  connect <device_name> (optional)\t Connect with a device (or try connecting to all known devices till one connects)"
+	echo -e "  disconnect                      \t Disconnect bluetooth from any connected device(s)"
+	echo -e "  on                              \t Power off bluetooth"
+	echo -e "  off                             \t Power off bluetooth"
+    exit 1
+fi
+
+action=$1
+device_name=$2
+
+case $action in
+    connect)
+        connect_device "$device_name"
+        ;;
+    disconnect)
+		bluetoothctl disconnect
+        ;;
+	on)
+		bluetoothctl power on
+		;;
+	off)
+		bluetoothctl power off
+		;;
+	restart)
+		restart_bluetooth
+		;;
+    *)
+        echo "Invalid action."
+        exit 1
+        ;;
+esac
