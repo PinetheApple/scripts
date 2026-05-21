@@ -25,6 +25,7 @@ enum Cmd {
     },
     Activate { name: Option<String> },
     Delete { name: Option<String> },
+    Pick { prompt: Option<String> },
 }
 
 fn list_venvs() -> Vec<String> {
@@ -39,6 +40,34 @@ fn list_venvs() -> Vec<String> {
         .filter(|l| !l.is_empty() && !l.contains('/'))
         .map(String::from)
         .collect()
+}
+
+fn detect_local_venv() -> Option<String> {
+    let venvs = list_venvs();
+    let cwd = std::env::current_dir().ok()?;
+
+    let mut dir = cwd.clone();
+    loop {
+        let candidate = dir.join(".python-version");
+        if candidate.exists() {
+            let contents = std::fs::read_to_string(&candidate).ok()?;
+            let name = contents.trim().to_string();
+            if venvs.contains(&name) {
+                return Some(name);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    let dir_name = cwd.file_name()?.to_string_lossy();
+    let conventional = format!("{}_venv", dir_name);
+    if venvs.contains(&conventional) {
+        return Some(conventional);
+    }
+
+    None
 }
 
 fn pick_venv(prompt: &str) -> Option<String> {
@@ -179,5 +208,19 @@ fn main() {
         }
 
         Cmd::Delete { name } => cmd_delete(name),
+
+        Cmd::Pick { prompt } => {
+            let label = prompt.as_deref().unwrap_or("activate");
+            if label == "activate" {
+                if let Some(local) = detect_local_venv() {
+                    println!("{}", local);
+                    return;
+                }
+            }
+            match pick_venv(label) {
+                Some(name) => println!("{}", name),
+                None => std::process::exit(1),
+            }
+        }
     }
 }
