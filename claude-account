@@ -1,0 +1,228 @@
+#!/bin/bash
+set -euo pipefail
+
+CRED_DIR="$HOME/.claude/credentials.d"
+ACTIVE_FILE="$HOME/.claude/.credentials-active"
+CRED_LIVE="$HOME/.claude/.credentials.json"
+
+mkdir -p "$CRED_DIR"
+
+get_active() {
+  if [[ -f "$ACTIVE_FILE" ]]; then
+    cat "$ACTIVE_FILE"
+  elif [[ -f "$CRED_LIVE" ]]; then
+    echo "(unnamed)"
+  else
+    echo ""
+  fi
+}
+
+list_accounts() {
+  local active
+  active=$(get_active)
+  mapfile -t names < <(ls "$CRED_DIR" 2>/dev/null | sed 's/\.json$//')
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    if [[ "$active" == "(unnamed)" ]]; then
+      echo "  (unnamed)  <active, no saved profile>"
+    else
+      echo "  (no accounts saved)"
+    fi
+    return
+  fi
+
+  for name in "${names[@]}"; do
+    local mark="  "
+    [[ "$name" == "$active" ]] && mark=" *"
+    echo "$mark $name"
+  done
+}
+
+profile_status() {
+  local name="$1" file="$CRED_DIR/$name.json"
+  [[ -f "$file" ]] || { echo "Account '$name' not found." >&2; exit 1; }
+
+  local exp sub tier now
+  exp=$(jq -r '.claudeAiOauth.expiresAt // empty' "$file")
+  sub=$(jq -r '.claudeAiOauth.subscriptionType // "?"' "$file")
+  tier=$(jq -r '.claudeAiOauth.rateLimitTier // "?"' "$file")
+  now=$(( $(date +%s) * 1000 ))
+
+  echo "Account: $name"
+  echo "  Plan: $sub  Tier: $tier"
+  if [[ -z "$exp" ]]; then
+    echo "  Token: (no expiry recorded)"
+  elif (( exp > now )); then
+    echo "  Token: valid until $(date -d "@$(( exp / 1000 ))")"
+  else
+    echo "  Token: expired $(date -d "@$(( exp / 1000 ))")"
+  fi
+}
+
+cmd_status() {
+  local name="${1:-}"
+  if [[ -n "$name" ]]; then
+    profile_status "$name"
+    return
+  fi
+
+  local active
+  active=$(get_active)
+  if [[ -z "$active" ]]; then
+    echo "Not logged in."
+    return
+  fi
+  if [[ "$active" == "(unnamed)" ]]; then
+    echo "Active account: (unnamed) — not saved as a profile"
+  else
+    echo "Active account: $active"
+  fi
+  claude auth status 2>/dev/null || echo "(session expired)"
+}
+
+cmd_list() {
+  echo "Claude Code accounts:"
+  list_accounts
+}
+
+cmd_current() {
+  local active
+  active=$(get_active)
+  [[ -n "$active" ]] || { echo "Not logged in." >&2; exit 1; }
+  echo "$active"
+}
+
+next_account() {
+  local active="$1"
+  mapfile -t names < <(ls "$CRED_DIR" 2>/dev/null | sed 's/\.json$//')
+  (( ${#names[@]} > 0 )) || { echo "No saved accounts to cycle." >&2; exit 1; }
+
+  local i
+  for i in "${!names[@]}"; do
+    [[ "${names[$i]}" == "$active" ]] && { echo "${names[$(( (i + 1) % ${#names[@]} ))]}"; return; }
+  done
+  echo "${names[0]}"
+}
+
+cmd_switch() {
+  local name="$1"
+  [[ -n "$name" ]] || name=$(next_account "$(get_active)")
+
+  local cred_file="$CRED_DIR/$name.json"
+  [[ -f "$cred_file" ]] || { echo "Account '$name' not found." >&2; exit 1; }
+
+  local active
+  active=$(get_active)
+  if [[ -n "$active" && "$active" != "(unnamed)" && -f "$CRED_LIVE" ]]; then
+    cp "$CRED_LIVE" "$CRED_DIR/$active.json"
+  fi
+
+  cp "$cred_file" "$CRED_LIVE"
+  echo "$name" > "$ACTIVE_FILE"
+  echo "Switched to '$name'."
+}
+
+cmd_login() {
+  local name="$1"
+  [[ -n "$name" ]] || { echo "Usage: claude-account login <name>" >&2; exit 1; }
+
+  local active
+  active=$(get_active)
+  if [[ -n "$active" && "$active" != "(unnamed)" && -f "$CRED_LIVE" ]]; then
+    cp "$CRED_LIVE" "$CRED_DIR/$active.json"
+  fi
+
+  rm -f "$CRED_LIVE" "$ACTIVE_FILE"
+
+  claude auth login
+  if [[ -f "$CRED_LIVE" ]]; then
+    cp "$CRED_LIVE" "$CRED_DIR/$name.json"
+    echo "$name" > "$ACTIVE_FILE"
+    echo "Saved as '$name'."
+  else
+    echo "Login did not produce credentials." >&2
+    exit 1
+  fi
+}
+
+cmd_logout() {
+  rm -f "$CRED_LIVE" "$ACTIVE_FILE"
+  echo "Logged out."
+}
+
+cmd_remove() {
+  local name="$1"
+  local cred_file="$CRED_DIR/$name.json"
+  [[ -f "$cred_file" ]] || { echo "Account '$name' not found." >&2; exit 1; }
+
+  local active
+  active=$(get_active)
+  if [[ "$name" == "$active" ]]; then
+    echo "Can't remove active account. Switch first." >&2
+    exit 1
+  fi
+
+  rm "$cred_file"
+  echo "Removed '$name'."
+}
+
+cmd_rename() {
+  local old="$1" new="$2"
+  local old_file="$CRED_DIR/$old.json"
+  local new_file="$CRED_DIR/$new.json"
+  [[ -f "$old_file" ]] || { echo "Account '$old' not found." >&2; exit 1; }
+  [[ ! -f "$new_file" ]] || { echo "Account '$new' already exists." >&2; exit 1; }
+
+  mv "$old_file" "$new_file"
+  local active
+  active=$(get_active)
+  if [[ "$active" == "$old" ]]; then
+    echo "$new" > "$ACTIVE_FILE"
+  fi
+  echo "Renamed '$old' → '$new'."
+}
+
+usage() {
+  cat <<EOF
+Usage: claude-account [command] [args]
+
+Commands:
+  list                        List all saved accounts
+  status [name]               Show active (or a named account's) status
+  current                     Print the active account name only
+  switch [name]               Switch to an account (no name = cycle to next)
+  login <name>                Log in and save as <name>
+  logout                      Log out entirely
+  remove <name>               Delete a saved account
+  rename <old> <new>          Rename a saved account
+  help, --help, -h            Show this help
+
+Without a command, defaults to list.
+EOF
+}
+
+main() {
+  local cmd="${1:-list}"
+
+  case "$cmd" in
+    help|--help|-h)
+      usage
+      ;;
+    list|status|current|logout)
+      "cmd_$cmd" "${@:2}"
+      ;;
+    switch|login|remove)
+      "cmd_$cmd" "$2"
+      ;;
+    rename)
+      cmd_rename "$2" "$3"
+      ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
