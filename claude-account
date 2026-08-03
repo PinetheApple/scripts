@@ -152,6 +152,8 @@ cmd_logout() {
 
 cmd_remove() {
   local name="$1"
+  [[ -n "$name" ]] || { echo "Usage: claude-account remove <name>" >&2; exit 1; }
+
   local cred_file="$CRED_DIR/$name.json"
   [[ -f "$cred_file" ]] || { echo "Account '$name' not found." >&2; exit 1; }
 
@@ -168,6 +170,8 @@ cmd_remove() {
 
 cmd_rename() {
   local old="$1" new="$2"
+  [[ -n "$old" && -n "$new" ]] || { echo "Usage: claude-account rename <old> <new>" >&2; exit 1; }
+
   local old_file="$CRED_DIR/$old.json"
   local new_file="$CRED_DIR/$new.json"
   [[ -f "$old_file" ]] || { echo "Account '$old' not found." >&2; exit 1; }
@@ -212,10 +216,10 @@ main() {
       "cmd_$cmd" "${@:2}"
       ;;
     switch|login|remove)
-      "cmd_$cmd" "$2"
+      "cmd_$cmd" "${2:-}"
       ;;
     rename)
-      cmd_rename "$2" "$3"
+      cmd_rename "${2:-}" "${3:-}"
       ;;
     *)
       echo "Unknown command: $cmd" >&2
