@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Append-only ledger of tasks worked on, with category-gap detection.
+
+Records live in ~/.config/ai/tasks/ledger.jsonl as events, not as mutable rows:
+several agents can append at once without a read-modify-write race, and task
+state is folded from the events at read time.
+
+`gaps` is the point of the whole thing — once a category has been worked N times
+and no skill or agent covers it, that workflow has earned tooling.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AI_ROOT = Path.home() / ".config" / "ai"
+LEDGER_DIR = AI_ROOT / "tasks"
+LEDGER = LEDGER_DIR / "ledger.jsonl"
+GAPS_IGNORE = LEDGER_DIR / "gaps-ignore.txt"
+SKILLS_DIR = AI_ROOT / "skills"
+AGENTS_DIR = AI_ROOT / "agents"
+
+STATUSES = ("in-progress", "done", "blocked", "abandoned")
+OPEN_STATUSES = ("in-progress", "blocked")
+GAP_THRESHOLD = 3
+SESSION_CONTEXT_LIMIT = 5
+ID_LENGTH = 8
+
+WORKTREE_SUFFIX = re.compile(r"--claude-worktrees-.*$")
+SINCE_PATTERN = re.compile(r"^(\d+)([dhw])$")
+SINCE_UNITS = {"d": "days", "h": "hours", "w": "weeks"}
+
+FIELDS = ("title", "summary", "status", "categories", "project")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def project_slug(path: str | None = None) -> str:
+    raw = str(Path(path or os.getcwd()).resolve())
+    return WORKTREE_SUFFIX.sub("", raw.replace("/", "-"))
+
+
+def parse_since(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    match = SINCE_PATTERN.match(value)
+    if match:
+        amount, unit = int(match.group(1)), SINCE_UNITS[match.group(2)]
+        return datetime.now(timezone.utc) - timedelta(**{unit: amount})
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        sys.exit(f"unparseable --since: {value} (use 7d, 24h, 2w or an ISO date)")
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def append(event: dict) -> None:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def read_events() -> list[dict]:
+    try:
+        lines = LEDGER.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def fold(events: list[dict]) -> dict[str, dict]:
+    """Replay events into current task state, keyed by task id."""
+    tasks: dict[str, dict] = {}
+    for event in events:
+        task_id = event.get("id")
+        if not task_id:
+            continue
+        task = tasks.setdefault(
+            task_id,
+            {
+                "id": task_id,
+                "created_at": event.get("ts"),
+                "categories": [],
+                "notes": [],
+            },
+        )
+        for field in FIELDS:
+            if event.get(field) is not None:
+                task[field] = event[field]
+        if event.get("note"):
+            task["notes"].append({"ts": event.get("ts"), "text": event["note"]})
+        task["updated_at"] = event.get("ts")
+    return tasks
+
+
+def select(
+    tasks: dict[str, dict],
+    status: str | None = None,
+    open_only: bool = False,
+    project: str | None = None,
+    category: str | None = None,
+    since: datetime | None = None,
+) -> list[dict]:
+    picked = []
+    for task in tasks.values():
+        if status and task.get("status") != status:
+            continue
+        if open_only and task.get("status") not in OPEN_STATUSES:
+            continue
+        if project and task.get("project") != project:
+            continue
+        if category and category not in task.get("categories", []):
+            continue
+        if since:
+            stamp = task.get("updated_at") or task.get("created_at")
+            if not stamp or datetime.fromisoformat(stamp) < since:
+                continue
+        picked.append(task)
+    return sorted(picked, key=lambda t: t.get("updated_at") or "", reverse=True)
+
+
+def resolve(tasks: dict[str, dict], prefix: str) -> dict:
+    matches = [task for task_id, task in tasks.items() if task_id.startswith(prefix)]
+    if not matches:
+        sys.exit(f"no task matching id {prefix!r}")
+    if len(matches) > 1:
+        sys.exit(f"ambiguous id {prefix!r}: {', '.join(t['id'] for t in matches)}")
+    return matches[0]
+
+
+def short_project(project: str | None) -> str:
+    return (project or "").rsplit("-", 1)[-1] or "?"
+
+
+def format_row(task: dict) -> str:
+    day = (task.get("updated_at") or "")[:10]
+    cats = ",".join(task.get("categories", [])) or "-"
+    return (
+        f"{task['id']}  {day}  {task.get('status', '?'):<12} "
+        f"{short_project(task.get('project')):<20} [{cats}] {task.get('title', '')}"
+    )
+
+
+def tooling_corpus() -> str:
+    parts: list[str] = []
+    for directory, pattern in ((SKILLS_DIR, "*/SKILL.md"), (AGENTS_DIR, "*.md")):
+        for path in sorted(directory.glob(pattern)):
+            parts.append(path.parent.name if path.name == "SKILL.md" else path.stem)
+            try:
+                parts.append(path.read_text(encoding="utf-8")[:1200])
+            except OSError:
+                continue
+    return "\n".join(parts).lower()
+
+
+def ignored_categories() -> set[str]:
+    try:
+        lines = GAPS_IGNORE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {line.strip().lower() for line in lines if line.strip() and not line.startswith("#")}
+
+
+def category_counts(tasks: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        for category in task.get("categories", []):
+            counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def find_gaps(tasks: list[dict], threshold: int) -> list[dict]:
+    corpus = tooling_corpus()
+    ignore = ignored_categories()
+    gaps = []
+    for category, count in category_counts(tasks).items():
+        if count < threshold or category.lower() in ignore:
+            continue
+        if category.lower().replace("-", " ") in corpus.replace("-", " "):
+            continue
+        gaps.append({"category": category, "count": count})
+    return gaps
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    task_id = uuid.uuid4().hex[:ID_LENGTH]
+    append(
+        {
+            "id": task_id,
+            "ts": now_iso(),
+            "op": "add",
+            "title": args.title,
+            "summary": args.summary,
+            "status": args.status,
+            "categories": args.category,
+            "project": args.project or project_slug(),
+            "note": args.note,
+        }
+    )
+    print(task_id)
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    tasks = fold(read_events())
+    task = resolve(tasks, args.id)
+    categories = task.get("categories", []) if args.category else None
+    if args.category:
+        categories = sorted(set(categories) | set(args.category))
+    append(
+        {
+            "id": task["id"],
+            "ts": now_iso(),
+            "op": "update",
+            "title": args.title,
+            "summary": args.summary,
+            "status": args.status,
+            "categories": categories,
+            "note": args.note,
+        }
+    )
+    print(task["id"])
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    tasks = fold(read_events())
+    picked = select(
+        tasks,
+        status=args.status,
+        open_only=args.open,
+        project=None if args.all_projects else (args.project or project_slug()),
+        category=args.category,
+        since=parse_since(args.since),
+    )[: args.limit]
+    if args.json:
+        json.dump(picked, sys.stdout, indent=2)
+        print()
+        return
+    if not picked:
+        print("no matching tasks")
+        return
+    for task in picked:
+        print(format_row(task))
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    task = resolve(fold(read_events()), args.id)
+    if args.json:
+        json.dump(task, sys.stdout, indent=2)
+        print()
+        return
+    print(f"{task['id']}  {task.get('title', '')}")
+    print(f"  status     {task.get('status', '?')}")
+    print(f"  categories {', '.join(task.get('categories', [])) or '-'}")
+    print(f"  project    {task.get('project', '-')}")
+    print(f"  created    {task.get('created_at', '-')}")
+    print(f"  updated    {task.get('updated_at', '-')}")
+    if task.get("summary"):
+        print(f"  summary    {task['summary']}")
+    for note in task.get("notes", []):
+        print(f"  note       [{(note['ts'] or '')[:10]}] {note['text']}")
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    tasks = fold(read_events())
+    picked = select(
+        tasks,
+        project=args.project,
+        since=parse_since(args.since),
+    )
+    counts = category_counts(picked)
+    statuses = {status: len(select(tasks, status=status)) for status in STATUSES}
+    if args.json:
+        json.dump({"categories": counts, "statuses": statuses, "total": len(picked)}, sys.stdout, indent=2)
+        print()
+        return
+    print(f"tasks in window: {len(picked)}")
+    print("by status: " + "  ".join(f"{k}={v}" for k, v in statuses.items()))
+    print("by category:")
+    for category, count in counts.items():
+        print(f"  {count:>3}  {category}")
+
+
+def cmd_gaps(args: argparse.Namespace) -> None:
+    picked = select(fold(read_events()), since=parse_since(args.since))
+    gaps = find_gaps(picked, args.threshold)
+    if args.json:
+        json.dump(gaps, sys.stdout, indent=2)
+        print()
+        return
+    if not gaps:
+        print("no uncovered categories")
+        return
+    for gap in gaps:
+        print(f"{gap['count']:>3}x  {gap['category']}  — no skill or agent covers this")
+    print("\nRun the `skill-distiller` skill to decide whether one deserves a skill or agent.")
+
+
+def cmd_session_context(args: argparse.Namespace) -> None:
+    tasks = fold(read_events())
+    project = args.project or project_slug()
+    open_tasks = select(tasks, open_only=True, project=project)[:SESSION_CONTEXT_LIMIT]
+    gaps = find_gaps(select(tasks, since=parse_since(args.since)), args.threshold)
+    if not open_tasks and not gaps:
+        return
+    lines = ["# Task Ledger"]
+    if open_tasks:
+        lines.append("\nOpen tasks in this project:")
+        lines += [f"- `{t['id']}` [{t.get('status')}] {t.get('title', '')}" for t in open_tasks]
+    if gaps:
+        listed = ", ".join(f"{g['category']} ({g['count']}x)" for g in gaps)
+        lines.append(
+            f"\nUncovered recurring categories: {listed}. "
+            "If one comes up again this session, propose a skill or agent via `skill-distiller`."
+        )
+    print("\n".join(lines))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="task-ledger", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="record a new task")
+    add.add_argument("title")
+    add.add_argument("--summary")
+    add.add_argument("--category", action="append", default=[])
+    add.add_argument("--status", choices=STATUSES, default="in-progress")
+    add.add_argument("--project")
+    add.add_argument("--note")
+    add.set_defaults(func=cmd_add)
+
+    update = sub.add_parser("update", help="change a task's status or details")
+    update.add_argument("id")
+    update.add_argument("--title")
+    update.add_argument("--summary")
+    update.add_argument("--category", action="append", default=[])
+    update.add_argument("--status", choices=STATUSES)
+    update.add_argument("--note")
+    update.set_defaults(func=cmd_update)
+
+    listing = sub.add_parser("list", help="list tasks (current project by default)")
+    listing.add_argument("--status", choices=STATUSES)
+    listing.add_argument("--open", action="store_true", help="in-progress and blocked only")
+    listing.add_argument("--project")
+    listing.add_argument("--all-projects", action="store_true")
+    listing.add_argument("--category")
+    listing.add_argument("--since")
+    listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    show = sub.add_parser("show", help="show one task in full")
+    show.add_argument("id")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_show)
+
+    stats = sub.add_parser("stats", help="counts by status and category")
+    stats.add_argument("--since")
+    stats.add_argument("--project")
+    stats.add_argument("--json", action="store_true")
+    stats.set_defaults(func=cmd_stats)
+
+    gaps = sub.add_parser("gaps", help="recurring categories with no skill or agent")
+    gaps.add_argument("--threshold", type=int, default=GAP_THRESHOLD)
+    gaps.add_argument("--since")
+    gaps.add_argument("--json", action="store_true")
+    gaps.set_defaults(func=cmd_gaps)
+
+    context = sub.add_parser("session-context", help="open tasks and gaps, for the SessionStart hook")
+    context.add_argument("--threshold", type=int, default=GAP_THRESHOLD)
+    context.add_argument("--since")
+    context.add_argument("--project")
+    context.set_defaults(func=cmd_session_context)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
