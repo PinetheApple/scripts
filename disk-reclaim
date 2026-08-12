@@ -1,0 +1,163 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_MOUNT="/"
+HOME_MOUNT="/home"
+PACMAN_CACHE="/var/cache/pacman/pkg"
+TRASH_DIR="$HOME/.local/share/Trash/files"
+CACHE_DIR="$HOME/.cache"
+JOURNAL_KEEP="200M"
+PACMAN_KEEP_VERSIONS=1
+CACHE_TOP_N=8
+LOW_SPACE_PCT=85
+
+usage() {
+  cat <<'USAGE'
+disk-reclaim - report disk usage and print the commands that reclaim it
+
+  disk-reclaim        full report
+  disk-reclaim -h     this help
+
+Read-only. It never deletes anything; the cleanup commands are printed for
+you to run. Root and /home are separate partitions here, so the report says
+which one is actually under pressure.
+USAGE
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+
+dir_size() {
+  [[ -d "$1" ]] || { echo 0; return; }
+  local bytes
+  bytes=$(du -sb "$1" 2>/dev/null | cut -f1 | head -1)
+  echo "${bytes:-0}"
+}
+
+rule() { printf '%s\n' "------------------------------------------------------------"; }
+
+mount_line() {
+  df -h --output=target,size,used,avail,pcent "$1" 2>/dev/null | tail -1
+}
+
+mount_pct() {
+  df --output=pcent "$1" 2>/dev/null | tail -1 | tr -dc '0-9'
+}
+
+docker_up() { have docker && docker info >/dev/null 2>&1; }
+
+report_mounts() {
+  printf 'FILESYSTEMS\n'
+  local m
+  for m in "$ROOT_MOUNT" "$HOME_MOUNT"; do
+    printf '  %s\n' "$(mount_line "$m")"
+  done
+
+  local root_pct home_pct
+  root_pct=$(mount_pct "$ROOT_MOUNT")
+  home_pct=$(mount_pct "$HOME_MOUNT")
+  printf '\n'
+  if (( root_pct >= LOW_SPACE_PCT )); then
+    printf '  ! %s at %s%% - docker and the pacman cache live here\n' "$ROOT_MOUNT" "$root_pct"
+  fi
+  if (( home_pct >= LOW_SPACE_PCT )); then
+    printf '  ! %s at %s%% - trash and ~/.cache live here\n' "$HOME_MOUNT" "$home_pct"
+  fi
+  if (( root_pct < LOW_SPACE_PCT && home_pct < LOW_SPACE_PCT )); then
+    printf '  Both partitions have headroom.\n'
+  fi
+}
+
+report_docker() {
+  printf '\nDOCKER (on %s)\n' "$ROOT_MOUNT"
+  if ! docker_up; then
+    printf '  docker unavailable, skipping\n'
+    return
+  fi
+  docker system df 2>/dev/null | sed 's/^/  /'
+  local unused_vols
+  unused_vols=$(docker volume ls -qf dangling=true 2>/dev/null | wc -l)
+  printf '  %s volumes are unreferenced - check `docker volume ls` before pruning\n' "$unused_vols"
+}
+
+report_root_dirs() {
+  printf '\nLARGEST DIRECTORIES ON %s\n' "$ROOT_MOUNT"
+  printf '  (root-owned trees such as /var/lib/docker read as smaller than they are)\n'
+  du -xh -d1 "$ROOT_MOUNT" 2>/dev/null \
+    | sort -rh \
+    | tail -n +2 \
+    | head -"$CACHE_TOP_N" \
+    | sed 's/^/    /' || true
+}
+
+report_pacman() {
+  printf '\nPACMAN CACHE\n'
+  local count size
+  count=$(find "$PACMAN_CACHE" -maxdepth 1 -name '*.pkg.tar*' 2>/dev/null | wc -l)
+  size=$(dir_size "$PACMAN_CACHE")
+  printf '  %s packages, %s\n' "$count" "$(human "$size")"
+}
+
+report_journal() {
+  printf '\nJOURNAL\n'
+  printf '  %s\n' "$(journalctl --disk-usage 2>/dev/null | tail -1)"
+}
+
+report_trash() {
+  printf '\nTRASH (on %s)\n' "$HOME_MOUNT"
+  printf '  %s in %s\n' "$(human "$(dir_size "$TRASH_DIR")")" "$TRASH_DIR"
+}
+
+report_cache() {
+  printf '\nUSER CACHE (on %s)\n' "$HOME_MOUNT"
+  printf '  %s total, largest entries:\n' "$(human "$(dir_size "$CACHE_DIR")")"
+  du -xh -d1 "$CACHE_DIR" 2>/dev/null \
+    | sort -rh \
+    | tail -n +2 \
+    | head -"$CACHE_TOP_N" \
+    | sed 's/^/    /' || true
+}
+
+cleanup_commands() {
+  cat <<PLAN
+
+CLEANUP COMMANDS - nothing above was changed, run what you want
+
+  no password needed
+    docker builder prune -af          build cache only, pure cache, safest
+    docker image prune -af            every image with no container behind it
+    docker volume prune -f            unreferenced volumes, may hold db data
+    uv cache prune                    stale wheels only
+    uv cache clean                    the whole uv cache, re-downloads later
+    poetry cache clear --all .
+    pnpm store prune
+    yarn cache clean
+    yay -Sc                           yay build cache in ~/.cache/yay
+    gio trash --empty
+
+  needs your password
+    sudo paccache -rk${PACMAN_KEEP_VERSIONS}                keep 1 version of installed packages
+    sudo paccache -ruk0               drop cache for uninstalled packages
+    sudo journalctl --vacuum-size=${JOURNAL_KEEP}
+
+Keep one cached version of installed packages so a downgrade stays possible.
+PLAN
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) printf 'Unknown option: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+esac
+
+rule
+report_mounts
+report_docker
+report_root_dirs
+report_pacman
+report_journal
+report_trash
+report_cache
+rule
+cleanup_commands
