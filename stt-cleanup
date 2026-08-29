@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Normalizes a raw ASR transcript with S1-mini via ollama.
+# Reads the transcript on stdin, writes the cleaned text to stdout.
+# On any failure the input is echoed back unchanged, so dictation still works
+# when ollama is down.
+
+set -uo pipefail
+
+MODEL="${STT_CLEANUP_MODEL:-s1-mini}"
+HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+STYLING="${STT_CLEANUP_STYLING:-semi-formal}"
+STRUCTURE="${STT_CLEANUP_STRUCTURE:-prose}"
+CONTEXT="${STT_CLEANUP_CONTEXT:-general}"
+KEEP_ALIVE="${STT_CLEANUP_KEEP_ALIVE:-30m}"
+TIMEOUT_SECS="${STT_CLEANUP_TIMEOUT:-20}"
+
+transcript=$(cat)
+[[ -z "${transcript// }" ]] && exit 0
+
+control="[Styling: $STYLING] [Structure: $STRUCTURE] [Context: $CONTEXT]"
+
+request=$(jq -nc \
+    --arg model "$MODEL" \
+    --arg prompt "$control"$'\n'"$transcript" \
+    --arg keep_alive "$KEEP_ALIVE" \
+    '{model: $model, prompt: $prompt, stream: false, keep_alive: $keep_alive,
+      options: {temperature: 0}}')
+
+response=$(curl -sS --max-time "$TIMEOUT_SECS" \
+    -H 'Content-Type: application/json' \
+    -d "$request" \
+    "$HOST/api/generate" 2>/dev/null)
+
+cleaned=$(jq -re '.response' <<<"$response" 2>/dev/null)
+
+if [[ -z "$cleaned" || "$cleaned" == "null" ]]; then
+    printf '%s' "$transcript"
+    exit 0
+fi
+
+printf '%s' "${cleaned}"
