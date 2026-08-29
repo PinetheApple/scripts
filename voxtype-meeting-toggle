@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Toggles voxtype meeting-mode transcription.
+#
+# Stopping copies the transcript to the clipboard and hands the meeting
+# id to the Quickshell review panel, which decides what happens on disk.
+
+set -uo pipefail
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/voxtype"
+STATE_FILE="$RUNTIME_DIR/meeting_state"
+REVIEW_FLAG="$RUNTIME_DIR/review.flag"
+EXPORT_TIMEOUT_SECS=20
+
+notify() {
+    notify-send -a voxtype "$1" "${2:-}"
+}
+
+meeting_status() {
+    [[ -r "$STATE_FILE" ]] && sed -n '1p' "$STATE_FILE" || printf 'idle'
+}
+
+meeting_id() {
+    [[ -r "$STATE_FILE" ]] && sed -n '2p' "$STATE_FILE"
+}
+
+start_meeting() {
+    if voxtype meeting start >/dev/null 2>&1; then
+        notify "Meeting transcription started"
+    else
+        notify "Failed to start meeting transcription"
+    fi
+}
+
+# `meeting stop` returns before the daemon has transcribed the final
+# chunk, so the export is empty for a second or two afterwards.
+await_transcript() {
+    local id=$1 deadline=$((SECONDS + EXPORT_TIMEOUT_SECS)) transcript
+
+    while (( SECONDS < deadline )); do
+        transcript=$(voxtype meeting export "$id" --format text 2>/dev/null)
+        if [[ -n "${transcript// }" ]]; then
+            printf '%s' "$transcript"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+stop_meeting() {
+    local id transcript words
+    id=$(meeting_id)
+
+    voxtype meeting stop >/dev/null 2>&1
+
+    if [[ -z "$id" ]]; then
+        notify "Meeting stopped" "No meeting id — nothing to review"
+        return
+    fi
+
+    if ! transcript=$(await_transcript "$id"); then
+        notify "Meeting stopped" "No transcript after ${EXPORT_TIMEOUT_SECS}s — kept as $id"
+        return
+    fi
+
+    printf '%s' "$transcript" | wl-copy
+    words=$(wc -w <<<"$transcript")
+
+    printf '%s' "$id" > "$REVIEW_FLAG"
+    notify "Transcript copied" "$words words — name it to keep it"
+}
+
+case "$(meeting_status)" in
+    recording|paused) stop_meeting ;;
+    *) start_meeting ;;
+esac
