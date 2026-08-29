@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# docr - render and verify documents (docx, pdf, pptx, xlsx, odt, html).
+#
+# Subcommands:
+#   docr png  FILE [-o DIR] [-r DPI] [-p PAGES]   render pages to PNG
+#   docr md   FILE [-o FILE]                      extract structured markdown
+#   docr pdf  FILE [-o FILE]                      convert to PDF
+#   docr diff A B [-r DPI]                        page-by-page pixel comparison
+#   docr info FILE                                page count, size, producer
+#   docr deps                                     report missing dependencies
+
+set -euo pipefail
+
+DEFAULT_DPI=150
+DIFF_TOLERANCE=8          # per-channel value ignored as antialiasing noise
+DIFF_FAIL_RATIO=0.001     # fraction of differing pixels that marks a page changed
+
+die() { printf 'docr: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+soffice_bin() {
+  for b in soffice libreoffice; do have "$b" && { echo "$b"; return; }; done
+  die "LibreOffice not installed (pacman -S libreoffice-fresh)"
+}
+
+DOCR_TMP=""
+cleanup() {
+  if [ -n "$DOCR_TMP" ]; then rm -rf "$DOCR_TMP"; fi
+}
+trap cleanup EXIT
+
+# Sets DOCR_TMP to a per-run temp dir, removed by the EXIT trap. Assigns
+# rather than echoes: a $(workdir) subshell would lose the global.
+workdir() {
+  if [ -z "$DOCR_TMP" ]; then
+    DOCR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/docr.XXXXXX")"
+  fi
+}
+
+ext() { local f="${1##*/}"; printf '%s' "${f##*.}" | tr 'A-Z' 'a-z'; }
+
+# Converts anything LibreOffice understands into a PDF, echoing the path.
+# A file that is already a PDF is passed through untouched.
+to_pdf() {
+  local src="$1" out="$2"
+  if [ "$(ext "$src")" = pdf ]; then
+    printf '%s' "$src"
+    return
+  fi
+  local so; so="$(soffice_bin)"
+  "$so" --headless --norestore \
+    --convert-to pdf --outdir "$out" "$src" >/dev/null 2>&1 \
+    || die "LibreOffice failed to convert $src"
+  local name; name="$(basename "${src%.*}").pdf"
+  [ -f "$out/$name" ] || die "no PDF produced for $src"
+  printf '%s' "$out/$name"
+}
+
+cmd_png() {
+  local src="" out="" dpi="$DEFAULT_DPI" pages=""
+  src="$1"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift 2 ;;
+      -r) dpi="$2"; shift 2 ;;
+      -p) pages="$2"; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  [ -f "$src" ] || die "no such file: $src"
+  out="${out:-$(dirname "$src")/$(basename "${src%.*}").pages}"
+  mkdir -p "$out"
+
+  workdir; local tmp="$DOCR_TMP"
+  local pdf; pdf="$(to_pdf "$src" "$tmp")"
+
+  local range=()
+  if [ -n "$pages" ]; then
+    range=(-f "${pages%-*}" -l "${pages#*-}")
+  fi
+  pdftoppm -png -r "$dpi" "${range[@]}" "$pdf" "$out/page"
+  ls "$out"/page-*.png 2>/dev/null | sort
+}
+
+cmd_md() {
+  local src="$1"; shift
+  local out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  [ -f "$src" ] || die "no such file: $src"
+  out="${out:-${src%.*}.md}"
+  local media="${out%.md}.media"
+
+  case "$(ext "$src")" in
+    pdf)
+      have pdftotext || die "poppler not installed"
+      pdftotext -layout "$src" "$out"
+      ;;
+    docx|odt|rtf|epub|html|htm)
+      have pandoc || die "pandoc not installed (pacman -S pandoc-cli)"
+      pandoc --from="$(pandoc_format "$src")" --to=gfm \
+        --wrap=none --extract-media="$media" "$src" -o "$out"
+      ;;
+    *)
+      have markitdown || die "markitdown not installed (pip install --user 'markitdown[all]')"
+      markitdown "$src" > "$out"
+      ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+pandoc_format() {
+  case "$(ext "$1")" in
+    docx) echo docx ;;
+    odt)  echo odt ;;
+    rtf)  echo rtf ;;
+    epub) echo epub ;;
+    *)    echo html ;;
+  esac
+}
+
+cmd_pdf() {
+  local src="$1"; shift
+  local out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) out="$2"; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  [ -f "$src" ] || die "no such file: $src"
+  out="${out:-${src%.*}.pdf}"
+  workdir; local tmp="$DOCR_TMP"
+  local pdf; pdf="$(to_pdf "$src" "$tmp")"
+  [ "$pdf" = "$out" ] || cp "$pdf" "$out"
+  printf '%s\n' "$out"
+}
+
+cmd_info() {
+  local src="$1"
+  [ -f "$src" ] || die "no such file: $src"
+  workdir; local tmp="$DOCR_TMP"
+  local pdf; pdf="$(to_pdf "$src" "$tmp")"
+  have pdfinfo || die "poppler not installed"
+  pdfinfo "$pdf"
+}
+
+cmd_diff() {
+  local a="$1" b="$2"; shift 2
+  local dpi="$DEFAULT_DPI"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r) dpi="$2"; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  [ -f "$a" ] || die "no such file: $a"
+  [ -f "$b" ] || die "no such file: $b"
+
+  workdir; local tmp="$DOCR_TMP"
+  mkdir -p "$tmp/a" "$tmp/b" "$tmp/diff"
+  cmd_png "$a" -o "$tmp/a" -r "$dpi" >/dev/null
+  cmd_png "$b" -o "$tmp/b" -r "$dpi" >/dev/null
+
+  local status=0
+  DOCR_TOLERANCE="$DIFF_TOLERANCE" DOCR_FAIL_RATIO="$DIFF_FAIL_RATIO" \
+    python3 - "$tmp/a" "$tmp/b" "$tmp/diff" <<'PY' || status=$?
+import os, sys, pathlib
+from PIL import Image, ImageChops
+
+tolerance = int(os.environ["DOCR_TOLERANCE"])
+fail_ratio = float(os.environ["DOCR_FAIL_RATIO"])
+left, right, outdir = (pathlib.Path(p) for p in sys.argv[1:4])
+
+pages = lambda d: sorted(d.glob("page-*.png"))
+a, b = pages(left), pages(right)
+
+if len(a) != len(b):
+    print(f"page count differs: {len(a)} vs {len(b)}")
+
+changed = []
+for i, (pa, pb) in enumerate(zip(a, b), start=1):
+    ia = Image.open(pa).convert("RGB")
+    ib = Image.open(pb).convert("RGB")
+    if ia.size != ib.size:
+        print(f"page {i}: size differs {ia.size} vs {ib.size}")
+        changed.append(i)
+        continue
+    delta = ImageChops.difference(ia, ib)
+    mask = delta.convert("L").point(lambda v: 255 if v > tolerance else 0)
+    differing = sum(mask.histogram()[1:])
+    ratio = differing / (mask.width * mask.height)
+    if ratio > fail_ratio:
+        changed.append(i)
+        path = outdir / f"page-{i:03d}.png"
+        ImageChops.invert(mask).save(path)
+        print(f"page {i}: {ratio:.4%} pixels differ")
+
+for i in range(len(b) + 1, len(a) + 1):
+    print(f"page {i}: present only in first document")
+for i in range(len(a) + 1, len(b) + 1):
+    print(f"page {i}: present only in second document")
+
+if changed:
+    print(f"CHANGED pages: {', '.join(map(str, changed))}")
+    sys.exit(1)
+print("IDENTICAL")
+PY
+
+  # Diff images live under the temp dir; copy them out before it is cleaned.
+  if [ -n "$(ls -A "$tmp/diff" 2>/dev/null)" ]; then
+    local keep="${TMPDIR:-/tmp}/docr-diff"
+    rm -rf "$keep"; mkdir -p "$keep"; cp "$tmp/diff"/*.png "$keep/"
+    printf 'diff masks: %s\n' "$keep"
+  fi
+  return $status
+}
+
+cmd_deps() {
+  local missing=0
+  check() {
+    if have "$1"; then printf '  ok      %-12s %s\n' "$1" "$(command -v "$1")"
+    else printf '  MISSING %-12s %s\n' "$1" "$2"; missing=1; fi
+  }
+  echo "docr dependencies:"
+  check pdftoppm  "pacman -S poppler"
+  check pdftotext "pacman -S poppler"
+  check pdfinfo   "pacman -S poppler"
+  check pandoc    "pacman -S pandoc-cli"
+  check soffice   "pacman -S libreoffice-fresh"
+
+  if have markitdown; then
+    printf '  ok      %-12s %s\n' markitdown "$(command -v markitdown)"
+  else
+    printf '  n/a     %-12s optional, for xlsx and pptx to markdown\n' markitdown
+  fi
+
+  if python3 -c 'import PIL' 2>/dev/null; then
+    printf '  ok      %-12s\n' pillow
+  else
+    printf '  MISSING %-12s pip install --user pillow\n' pillow
+    missing=1
+  fi
+
+  # Word's default faces. Arch has no Calibri/Cambria packages; carlito and
+  # caladea are the metric-compatible substitutes LibreOffice maps to.
+  local fonts; fonts="$(fc-list 2>/dev/null || true)"
+  font_pair() {
+    if printf '%s' "$fonts" | grep -qiE "$1|$2"; then
+      printf '  ok      %-12s\n' "$1"
+    else
+      printf '  warn    %-12s pacman -S %s (layout drifts without it)\n' "$1" "$3"
+    fi
+  }
+  font_pair Calibri Carlito carlito
+  font_pair Cambria Caladea caladea
+
+  return $missing
+}
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+[ $# -ge 1 ] || { usage; exit 1; }
+sub="$1"; shift
+case "$sub" in
+  png)  cmd_png "$@" ;;
+  md)   cmd_md "$@" ;;
+  pdf)  cmd_pdf "$@" ;;
+  diff) cmd_diff "$@" ;;
+  info) cmd_info "$@" ;;
+  deps) cmd_deps ;;
+  -h|--help|help) usage ;;
+  *) die "unknown subcommand: $sub" ;;
+esac
