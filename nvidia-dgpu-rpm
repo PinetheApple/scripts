@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Pin the discrete GPU awake while it drives an external display.
+# Runtime-suspending a card with an active scanout head causes
+# "Lost display notification" and then a flip-event timeout that kills output.
+set -euo pipefail
+
+readonly DGPU_PCI_PATH=/sys/bus/pci/devices/0000:01:00.0
+readonly INTERNAL_CONNECTOR=eDP
+
+power_control_path() {
+    printf '%s/power/control' "$DGPU_PCI_PATH"
+}
+
+# Card numbering is not stable across boots, so resolve it from the PCI address.
+dgpu_card_dir() {
+    local card
+    for card in "$DGPU_PCI_PATH"/drm/card*; do
+        [[ -d "$card" ]] && { printf '%s' "$card"; return 0; }
+    done
+    return 1
+}
+
+external_display_connected() {
+    local connector card
+    card=$(dgpu_card_dir) || return 1
+    for connector in "$card"/"$(basename "$card")"-*; do
+        [[ -r "$connector/status" ]] || continue
+        [[ "$connector" == *"$INTERNAL_CONNECTOR"* ]] && continue
+        [[ "$(<"$connector/status")" == connected ]] && return 0
+    done
+    return 1
+}
+
+main() {
+    local target control
+    control=$(power_control_path)
+    [[ -w "$control" ]] || { echo "not writable: $control" >&2; exit 1; }
+
+    if external_display_connected; then
+        target=on
+    else
+        target=auto
+    fi
+
+    [[ "$(<"$control")" == "$target" ]] && exit 0
+    printf '%s' "$target" > "$control"
+    logger -t nvidia-dgpu-rpm "runtime PM set to $target"
+}
+
+main "$@"

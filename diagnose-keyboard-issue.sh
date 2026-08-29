@@ -19,7 +19,7 @@ for o in input:kb_layout input:kb_variant input:kb_options; do
 done
 
 echo; echo "=== virtual keyboard clients (can hijack the seat keymap) ==="
-pgrep -af 'ydotoold|wtype|makima|openwhispr|wl-kbptr' || echo none
+pgrep -af 'ydotoold|wtype|makima|voxtype|wl-kbptr' || echo none
 
 echo; echo "=== STEP 1: raw scancode from the hardware ==="
 for dev in "AT Translated Set 2 keyboard" "ITE Tech. Inc. ITE Device(8258) Keyboard"; do
