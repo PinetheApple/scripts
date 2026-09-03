@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Run a command on the discrete GPU while on AC power, the integrated GPU on battery.
+# Override with GPU_AUTO_FORCE=discrete|integrated.
+set -euo pipefail
+
+readonly AC_ONLINE=/sys/class/power_supply/ACAD/online
+readonly VULKAN_DISCRETE='nvidia*'
+readonly VULKAN_INTEGRATED='radeon*'
+
+usage() {
+    echo "usage: ${0##*/} <command> [args...]" >&2
+    exit 2
+}
+
+on_ac_power() {
+    [[ -r $AC_ONLINE && $(<"$AC_ONLINE") == 1 ]]
+}
+
+want_discrete() {
+    case "${GPU_AUTO_FORCE:-}" in
+        discrete) return 0 ;;
+        integrated) return 1 ;;
+        *) on_ac_power ;;
+    esac
+}
+
+(($# > 0)) || usage
+
+if want_discrete; then
+    exec env \
+        __NV_PRIME_RENDER_OFFLOAD=1 \
+        __GLX_VENDOR_LIBRARY_NAME=nvidia \
+        VK_LOADER_DRIVERS_SELECT="$VULKAN_DISCRETE" \
+        "$@"
+fi
+
+exec env VK_LOADER_DRIVERS_SELECT="$VULKAN_INTEGRATED" "$@"
